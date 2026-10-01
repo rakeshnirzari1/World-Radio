@@ -198,6 +198,64 @@ export const PlayerProvider = ({ children }) => {
   // True when silence is deliberate (user pressed pause, or voice search is
   // listening) — the buffering watchdog must never "fix" that by playing.
   const userPausedRef = useRef(false);
+  // Set when the PLATFORM paused the element without being asked — a phone call
+  // taking the audio session, a Siri announcement, a car's Bluetooth pause button, a
+  // wake from sleep. While it is in force nothing in this file restarts playback.
+  const interruptionRef = useRef({ active: false, since: 0, why: null });
+
+  // ---- Interruptions: obey the platform, don't race it ---------------------
+  //
+  // This player used to treat every unprompted pause as a fault to undo, from three
+  // places at once: a 1.2s timer on the element's own pause, a 3s kick loop and a
+  // widening backoff ladder. On an iPhone that is wrong, and expensively so: iOS pauses
+  // this element when a call takes the audio session, and the restart that follows is
+  // permitted often enough that the radio came back up *during* the call (measured on
+  // the live bundle: one play() 1.2s after the pause, the element left playing). So the
+  // pause is obeyed — every automatic restart stands down, and the station, its buffer
+  // and the media session's buttons stay exactly where they are.
+  //
+  // The return is driven by evidence, never by a timer: the platform resuming the
+  // element itself, the page becoming visible again (what happens when the listener
+  // looks at the phone after a call), a lock-screen or car play press, or the listener
+  // choosing a station. Silence during the interruption is what can be promised; a
+  // ladder of play() attempts cannot be, because it is judged by an ear on a call.
+  //
+  // Said plainly because it cannot be fixed: no web API reports that a call is in
+  // progress. If the platform never pauses the element, nothing in the page knows a
+  // call is happening and the radio keeps playing.
+  const startInterruption = useCallback((why) => {
+    if (interruptionRef.current.active) return;
+    interruptionRef.current = { active: true, since: Date.now(), why };
+    trace("interrupt.obey", { why });
+  }, []);
+
+  const endInterruption = useCallback((why) => {
+    if (!interruptionRef.current.active) return;
+    trace("interrupt.end", {
+      why,
+      lastedMs: Date.now() - interruptionRef.current.since,
+    });
+    interruptionRef.current = { active: false, since: 0, why: null };
+  }, []);
+
+  // Both the element's own listener and the capture-phase document listener report the
+  // same pause, so starting is idempotent. The settle delay is what keeps two innocent
+  // events out of it: a gapless handover pauses the *outgoing* element, and a platform
+  // that pauses and immediately resumes fires its own play within milliseconds. By the
+  // time this runs, something has to actually still be silent.
+  const handleUnpromptedPause = useCallback(
+    (el) => {
+      setTimeout(() => {
+        const a = audioRef.current;
+        if (!a || a !== el) return;
+        if (!a.paused) return;
+        if (!a.getAttribute("src") || a.ended) return;
+        if (userPausedRef.current || adRef.current.active) return;
+        startInterruption("platform");
+      }, 400);
+    },
+    [startInterruption]
+  );
 
   // The rescue ladder is walked in order, and the chime is created lazily: an
   // AudioContext created before any user gesture starts suspended.
@@ -363,6 +421,9 @@ export const PlayerProvider = ({ children }) => {
       setIsBuffering(buffering);
       pendingRef.current = station;
       userPausedRef.current = false;
+      // A station the listener chose is a request for sound, so it ends an
+      // interruption rather than waiting for one of the resume signals.
+      endInterruption("tune");
       // Selecting a station cancels any ad break in progress.
       adRef.current.active = false;
       adRef.current.station = null;
@@ -383,7 +444,7 @@ export const PlayerProvider = ({ children }) => {
         });
       }
     },
-    [pushHistory]
+    [pushHistory, endInterruption]
   );
 
   const _start = useCallback(
@@ -809,6 +870,9 @@ export const PlayerProvider = ({ children }) => {
   useEffect(() => {
     const id = setInterval(() => {
       if (adRef.current.active || userPausedRef.current) return;
+      // Silence the platform asked for is not a station that failed to start:
+      // advancing here would put a rescue stream on air during the call.
+      if (interruptionRef.current.active) return;
       if (skipRef.current >= SKIP_LIMIT) return;
       const station = pendingRef.current;
       if (!station) return;
@@ -880,6 +944,13 @@ export const PlayerProvider = ({ children }) => {
     if (!isActive(e)) return;
     setIsPlaying(true);
     setIsBuffering(false);
+    // Sound is flowing again, so whatever took the audio session has given it back:
+    // a call ended, or Siri finished. Nothing needs restarting — the only casualty of
+    // an interruption is the Now Playing card, and this is what puts it back.
+    if (interruptionRef.current.active) {
+      endInterruption("element");
+      registerMediaActions();
+    }
     setError(null);
     setBlocked(false);
     skipRef.current = 0;
@@ -913,7 +984,7 @@ export const PlayerProvider = ({ children }) => {
         }
       }
     }
-  }, []);
+  }, [endInterruption]);
 
   const onWaiting = useCallback((e) => {
     if (!isActive(e)) return;
@@ -926,24 +997,16 @@ export const PlayerProvider = ({ children }) => {
   const onPause = useCallback((e) => {
     if (!isActive(e)) return;
     setIsPlaying(false);
-    // iOS can pause the element by itself (screen lock plus a stalled stream). If
-    // the driver never asked for a pause, push it back on: a silent element is
-    // what costs us the card and the car buttons.
+    // A pause we did not ask for is the platform's, not an instruction to fight.
+    // iOS pauses this element for a phone call (and for Siri, a car's Bluetooth
+    // pause button, a wake from sleep), and restarting it a second later is exactly
+    // what made the radio audible right through a call — the play() that follows is
+    // permitted often enough to matter. So it is obeyed here: the station stays
+    // loaded, the element stays paused, and the resume comes from evidence that the
+    // interruption is over.
     if (userPausedRef.current || adRef.current.active) return;
-    setTimeout(() => {
-      const el = audioRef.current;
-      if (
-        el &&
-        el.paused &&
-        !el.ended &&
-        el.getAttribute("src") &&
-        !userPausedRef.current &&
-        !adRef.current.active
-      ) {
-        el.play().catch(() => {});
-      }
-    }, 1200);
-  }, []);
+    handleUnpromptedPause(e.currentTarget);
+  }, [handleUnpromptedPause]);
 
   const onError = useCallback((e) => {
     if (!isActive(e)) return;
@@ -1163,6 +1226,12 @@ export const PlayerProvider = ({ children }) => {
       if (adRef.current.active) return;
       // Paused on purpose — don't surprise the driver with a new station.
       if (userPausedRef.current) {
+        setIsBuffering(false);
+        return;
+      }
+      // Paused by the platform (a call): the station is not at fault, and starting a
+      // rescue stream now would be audible on the call this is obeying.
+      if (interruptionRef.current.active) {
         setIsBuffering(false);
         return;
       }
@@ -1567,9 +1636,10 @@ export const PlayerProvider = ({ children }) => {
       a.pause();
     } else {
       userPausedRef.current = false;
+      endInterruption("toggle");
       a.play().catch(() => {});
     }
-  }, [current, isPlaying]);
+  }, [current, isPlaying, endInterruption]);
 
   // Recover, don't just un-pause. If the element is parked on a URL that can
   // never play — the failure that used to require a page refresh — play()
@@ -1592,6 +1662,8 @@ export const PlayerProvider = ({ children }) => {
 
   const resume = useCallback(() => {
     userPausedRef.current = false;
+    // The listener — or their lock screen, or the car — has asked for sound.
+    endInterruption("action");
     const a = audioRef.current;
     if (!a) return;
     const src = a.getAttribute("src");
@@ -1600,13 +1672,14 @@ export const PlayerProvider = ({ children }) => {
       return;
     }
     retune();
-  }, [retune]);
+  }, [retune, endInterruption]);
 
-  // iOS sometimes pauses the element by itself when the screen locks and a
-  // stream stalls. If the driver never asked for a pause, push playback back on:
-  // silence is what costs us the lock-screen card and the car buttons.
-  // The per-element pause/resume kick lives in onPause, so it also covers elements
-  // created later by a handover. This interval is the slow safety net behind it.
+  // The slow safety net behind the player: it re-opens a stream whose connection died
+  // without raising an error, and restarts an element that went silent for a reason
+  // that is not a platform interruption — silence is what costs us the lock-screen
+  // card and the car buttons. While an interruption is in force it stands down
+  // completely: the platform asked for the quiet, and everything it would do here is
+  // audible.
   useEffect(() => {
     // `lastTime`/`hits` live in this closure: they only need to survive between
     // ticks of this interval, and a ref would be one more thing to keep in step.
@@ -1615,6 +1688,9 @@ export const PlayerProvider = ({ children }) => {
     const kick = () => {
       const a = audioRef.current;
       if (!a || adRef.current.active || userPausedRef.current) return;
+      // While an interruption is in force the player is silent on purpose, so this
+      // must neither restart the element nor re-open the stream: both are audible.
+      if (interruptionRef.current.active) return;
       if (!a.getAttribute("src") || a.ended) return;
       if (a.paused) {
         a.play().catch(() => {});
@@ -1650,77 +1726,26 @@ export const PlayerProvider = ({ children }) => {
     reconnectRef.current = reconnect;
   }, [reconnect]);
 
-  // A pause we did not ask for is an interruption, not an instruction. On a locked
-  // phone the system pauses the element for its own reasons — a call taking the audio
-  // session, a Siri announcement, a car's Bluetooth pause button, waking from sleep —
-  // and any of those ends the Now Playing session if it is allowed to stand. So the
-  // station is left loaded, the media session is left alone, and playback is retried
-  // with a widening backoff until it comes back: that is what makes the radio return
-  // by itself after a call, without ever losing the lock-screen controls.
+  // The platform's pause, caught on document in the capture phase: media events do not
+  // bubble, and this is the listener that sees the pause from whichever element is
+  // current — including one the app did not build (the advert's). The element's own
+  // listener reports the same event; starting an interruption twice is a no-op.
   //
-  // A deliberate silence is the sleep timer's job, and that one is honoured.
+  // There is deliberately no timer here any more. A retry ladder cannot tell "iOS took
+  // the audio session for a call" from "the stream glitched", and on a phone the first
+  // case is the one that matters: every rung it climbed was a chance to be audible
+  // during the call. The resume comes from the evidence paths instead (the element
+  // playing again, the page becoming visible, a media-session press, a station chosen).
   useEffect(() => {
-    // The first attempts are quick, because most interruptions are brief (a Siri
-    // announcement, a wake from sleep) and should cost the listener nothing. Then it
-    // settles into a steady retry that never gives up: a phone call can hold the
-    // audio session for as long as the call lasts, and a ladder with a bottom rung
-    // leaves a dead player behind afterwards — which is exactly what was reported.
-    const DELAYS = [1200, 4000, 10000];
-    let timer = null;
-    let ticker = null;
-    let tries = 0;
-    const stopTimers = () => {
-      if (timer) clearTimeout(timer);
-      if (ticker) clearInterval(ticker);
-      timer = null;
-      ticker = null;
-    };
-    const attempt = () => {
-      timer = null;
-      const a = audioRef.current;
-      if (!a || !a.getAttribute("src")) return;
-      if (userPausedRef.current || sleepEndsAt || adRef.current.active) return;
-      if (!a.paused) {
-        tries = 0;
-        if (ticker) {
-          clearInterval(ticker);
-          ticker = null;
-        }
-        // Sound is back, so put the lock-screen card and the car's buttons back with
-        // it: iOS only honours handlers registered after playback began.
-        registerMediaActions();
-        return;
-      }
-      a.play().catch(() => {});
-      tries += 1;
-      if (tries <= DELAYS.length) {
-        timer = setTimeout(attempt, DELAYS[Math.min(tries, DELAYS.length) - 1]);
-      } else if (!ticker) {
-        ticker = setInterval(attempt, 30000);
-      }
-    };
-    // Capture phase on the document: media events do not bubble, so this is the one
-    // listener that catches a pause from whichever element is current — including the
-    // element a gapless handover is about to replace.
-    const onPause = (e) => {
+    const onPauseCapture = (e) => {
       const a = audioRef.current;
       if (!a || e.target !== a || a.ended) return;
-      if (userPausedRef.current || sleepEndsAt) return;
-      trace("interrupt.pause", { readyState: a.readyState });
-      stopTimers();
-      tries = 0;
-      timer = setTimeout(attempt, DELAYS[0]);
+      if (userPausedRef.current || adRef.current.active) return;
+      handleUnpromptedPause(a);
     };
-    document.addEventListener("pause", onPause, true);
-    return () => {
-      document.removeEventListener("pause", onPause, true);
-      stopTimers();
-    };
-  // Deliberately not a dependency. `registerMediaActions` is declared further down
-  // this component, and a dependency array is evaluated during the render — naming
-  // it here throws "cannot access before initialization" and blanks the whole app.
-  // The effect body may still call it: by then it exists, and it is stable.
-  }, [sleepEndsAt]);
+    document.addEventListener("pause", onPauseCapture, true);
+    return () => document.removeEventListener("pause", onPauseCapture, true);
+  }, [handleUnpromptedPause]);
 
   // The one moment execution is guaranteed to come back: the page becoming visible
   // again (the phone was unlocked, or the app was brought forward). A backgrounded
@@ -1737,10 +1762,14 @@ export const PlayerProvider = ({ children }) => {
       if (!a || !a.getAttribute("src")) return;
       if (userPausedRef.current || sleepEndsAt || adRef.current.active) return;
       if (!a.paused) {
+        endInterruption("playing");
         registerMediaActions();
         return;
       }
+      // The one trigger iOS always delivers after a call: the listener looked at the
+      // phone. This is what ends the interruption and puts the sound back.
       trace("resume.visible", { readyState: a.readyState });
+      endInterruption("visible");
       a.play()
         .then(() => registerMediaActions())
         .catch(() => {});
@@ -1760,7 +1789,7 @@ export const PlayerProvider = ({ children }) => {
   // this component, and a dependency array is evaluated during the render — naming
   // it here throws "cannot access before initialization" and blanks the whole app.
   // The effect body may still call it: by then it exists, and it is stable.
-  }, [sleepEndsAt]);
+  }, [sleepEndsAt, endInterruption]);
 
   // The other half of a network change: the phone says it is back, so re-open the
   // stream now rather than waiting for a timeout to notice.
@@ -1769,6 +1798,7 @@ export const PlayerProvider = ({ children }) => {
       const a = audioRef.current;
       if (!a || !a.getAttribute("src") || a.ended) return;
       if (userPausedRef.current || sleepEndsAt || adRef.current.active) return;
+      if (interruptionRef.current.active) return;
       if (!a.paused && a.readyState >= 3) return;
       reconnectRef.current("online");
     };
@@ -1880,9 +1910,13 @@ export const PlayerProvider = ({ children }) => {
       // Report "playing" for as long as a station is selected and the driver has
       // not asked for a pause — including while tuning or skipping. Silence plus
       // "paused" is what makes iOS take the card away; this is the honest signal
-      // for a live-radio player that intends to be audible.
+      // for a live-radio player that intends to be audible. An interruption is the
+      // exception: the platform has taken the audio session away, so "paused" is the
+      // truth, and claiming otherwise is what would strand the card on a phantom.
       navigator.mediaSession.playbackState =
-        current && !blocked && !userPausedRef.current ? "playing" : "paused";
+        current && !blocked && !userPausedRef.current && !interruptionRef.current.active
+          ? "playing"
+          : "paused";
     } catch {
       /* ignore */
     }
@@ -1926,8 +1960,9 @@ export const PlayerProvider = ({ children }) => {
     // a lock-screen or car pause press inside the page: declare it unsupported instead
     // and iOS pauses the element itself, then refuses to restart audio the user paused —
     // the station stays silent until the phone is unlocked. A 100ms resume is a visible
-    // no-op, which is the intent, and an incoming call is unaffected (the platform takes
-    // the audio session, the interruption ladder below brings the radio back by itself).
+    // no-op, which is the intent, and an incoming call is unaffected: a call pauses the
+    // *element*, not the session, and that pause is obeyed by the interruption path
+    // (startInterruption) instead of being raced by a retry ladder.
     set("pause", () => {
       actionsRef.current.resume();
       registerMediaActions();
