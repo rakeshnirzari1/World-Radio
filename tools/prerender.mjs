@@ -8,6 +8,8 @@
  *
  *   build/station/<slug>/index.html         the app shell, per-station head
  *   build/station/<slug>/<uuid>/index.html  the old address, canonical to the new
+ *                                           (top of the catalogue only — see
+ *                                           LEGACY_ADDRESS_LIMIT)
  *   build/country/<country>/index.html      a real static directory page
  *   build/genre/<genre>/index.html          a real static directory page
  *   build/countries/, build/genres/         hubs linking every directory page
@@ -39,12 +41,19 @@ import { byImportance, slugify } from "./stationSlug.mjs";
 const BUILD_DIR = process.env.BUILD_DIR || "frontend/build";
 const SITE = (process.env.SITE_URL || "https://worldradio.io").replace(/\/+$/, "");
 const API = process.env.RB_API || "https://de1.api.radio-browser.info";
-// 4,000 stations rather than 2,000: a shared link that lands on a page with no
-// preview at all looks broken, and the stations people share are not always the
-// most-clicked ones. A deployment costs ~12,000 files at this level, against a
-// 20,000-file ceiling, so coverage can double without risk.
-const STATION_LIMIT = Number(process.env.PRERENDER_LIMIT || 4000);
-const OG_STATION_CARDS = Number(process.env.OG_STATION_CARDS || 4000);
+// Coverage is the single biggest SEO lever this site has. Every station page is a
+// real, uniquely-titled HTML file; every station WITHOUT one is answered by the
+// 404 shell, which carries the site's home title — and Google indexed thousands of
+// those as duplicates (all titled "Live radio from around the world"). The cap is
+// files, not bytes: Cloudflare Pages allows 20,000 per deployment, so the budget
+// below buys ~10,000 stations by dropping the redundant <slug>/<uuid> copies for
+// everything but the most-shared stations and trimming per-station OG cards.
+const STATION_LIMIT = Number(process.env.PRERENDER_LIMIT || 10000);
+const OG_STATION_CARDS = Number(process.env.OG_STATION_CARDS || 2200);
+// The old `/station/<slug>/<uuid>/` address is only kept alive for links already
+// sitting in people's messages. The SPA resolves both shapes, so a copy is only
+// needed where a crawler or a chat preview reads the HTML — the top of the list.
+const LEGACY_ADDRESS_LIMIT = Number(process.env.LEGACY_ADDRESS_LIMIT || 600);
 const MIN_COUNTRY_STATIONS = Number(process.env.MIN_COUNTRY_STATIONS || 3);
 const TAG_LIMIT = Number(process.env.TAG_LIMIT || 140);
 const MIN_TAG_STATIONS = Number(process.env.MIN_TAG_STATIONS || 40);
@@ -64,6 +73,21 @@ const write = (relPath, html) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, html);
 };
+
+// Meta descriptions are cut by Google at roughly 155-160 characters. Cutting on a
+// word boundary here beats a search result ending in "…AAC+ at 64 kb".
+const clamp = (s, max = 155) => {
+  const text = String(s || "").replace(/\s+/g, " ").trim();
+  if (text.length <= max) return text;
+  const cut = text.lastIndexOf(" ", max - 1);
+  return `${text.slice(0, cut > 80 ? cut : max - 1).trim()}…`;
+};
+
+// Tag names come from the catalogue in whatever case a contributor typed — "jazz",
+// "hip hop", "80s". A heading reads better title-cased and the meta title has to
+// look like something a person would click, so capitalise each word.
+const titleCase = (s) =>
+  String(s || "").replace(/(^|[\s/&-])([a-z\u00e0-\u024f])/g, (m, sep, ch) => sep + ch.toUpperCase());
 
 const api = async (endpoint) => {
   const res = await fetch(`${API}${endpoint}`, { headers: { Accept: "application/json" } });
@@ -104,6 +128,12 @@ const tagsOf = (station) =>
 // ---------------------------------------------------------------------------
 
 const cards = [];
+// A share card is only worth pointing at if the file is actually in the build: the
+// committed set covers the old catalogue, and the country/genre list grows. A
+// missing card is a broken og:image in every chat app, so fall back to the site card.
+const hasCard = (kind, slug) =>
+  fs.existsSync(path.join(BUILD_DIR, "og", kind, `${slug}.jpg`));
+
 const card = (kind, slug, title, subtitle, image) => {
   const rel = `/og/${kind}/${slug}.jpg`;
   cards.push({
@@ -292,17 +322,41 @@ const stationPage = ({ shell, station, canonical, ogImage, related }) => {
   // The formal country name is right for matching a station to its country page
   // and wrong for everything a human or a crawler reads.
   const countryName = (related.country && related.country.name) || station.country;
-  const place = [station.state, countryName].filter(Boolean).join(", ");
-  const title = `${station.name}${place ? ` — ${place}` : ""} | Live radio on World Radio`;
-  // Parentheses rather than "from <country>": the formal names drop their "The"
-  // in countryDisplay(), and "from United Kingdom" is the sort of thing a search
-  // result shows back to you.
-  const desc = `Listen live to ${station.name}${
-    place ? ` (${place})` : ""
-  } on World Radio. ${station.codec ? station.codec.toUpperCase() : "Audio"}${
-    station.bitrate ? ` at ${station.bitrate} kbps` : ""
-  }, free, no account needed.`;
+  // `state` is free text from the catalogue and arrives in whatever case the
+  // broadcaster typed ("tokyo", "Gauteng/limpopo"). A title reads it back to you,
+  // so it has to be title-cased; the country is already normalised.
+  const place = [titleCase(station.state), countryName].filter(Boolean).join(", ");
   const genres = related.genres.map((g) => g.name).join(", ");
+
+  // Title: the station name is what people type, so it goes first; "Live Radio"
+  // and the place are what distinguish two stations that share a name. Long
+  // names fall back to the country alone, then to dropping the brand — a
+  // truncated brand costs nothing, a truncated station name loses the query.
+  const titleFor = (where) =>
+    `${station.name} — Live Radio${where ? ` from ${where}` : ""} | World Radio`;
+  let title = titleFor(place);
+  if (title.length > 68 && countryName) title = titleFor(countryName);
+  if (title.length > 72) title = `${station.name} — Live Radio | World Radio`;
+
+  // Description: what it is, where it is, what it plays, how it streams, and the
+  // one promise that matters on a search result ("no app, no account"). Genre
+  // tags are what make this paragraph different for every station rather than a
+  // codec string repeated 10,000 times.
+  const kind = genres
+    ? `${genres} radio`
+    : station.language
+    ? `${station.language} radio`
+    : "Live radio";
+  // Radio-Browser uses the literal string "UNKNOWN" for a codec it could not
+  // detect; printing it in a search result looks broken.
+  const codec =
+    station.codec && !/^unknown$/i.test(station.codec) ? station.codec.toUpperCase() : "";
+  const tech = [codec, station.bitrate ? `${station.bitrate} kbps` : ""].filter(Boolean).join(" ");
+  const desc = clamp(
+    `${station.name}${place ? ` from ${place}` : ""} — ${kind}. Listen live and free${
+      tech ? ` at ${tech}` : ""
+    }, no app or account. Works on phone, desktop and in the car.`
+  );
 
   const head = `
     <title>${escapeHtml(title)}</title>
@@ -605,8 +659,14 @@ const main = async () => {
   write(
     "countries/index.html",
     directoryPage({
-      title: "Radio stations by country — listen live on World Radio",
-      description: `Browse live radio from ${countriesWithStations.length} countries. Pick a country to see its most-played stations and listen instantly — free, no account, works on phone, desktop and car.`,
+      title: "Radio Stations by Country — Listen Live Worldwide | World Radio",
+      description: clamp(
+        `Browse live radio from ${countriesWithStations.length} countries — ${countriesWithStations
+          .reduce((n, c) => n + c.count, 0)
+          .toLocaleString(
+            "en-AU"
+          )} stations in total. Pick a country to see its most-played stations and listen instantly, free, on phone, desktop or in the car.`
+      ),
       heading: "Radio stations by country",
       lede: `Live radio from ${countriesWithStations.length} countries and ${countriesWithStations
         .reduce((n, c) => n + c.count, 0)
@@ -629,11 +689,13 @@ const main = async () => {
   write(
     "genres/index.html",
     directoryPage({
-      title: "Radio stations by genre — listen live on World Radio",
-      description: `Browse live radio by genre: ${genres
-        .slice(0, 7)
-        .map((g) => g.name)
-        .join(", ")} and more. Pick a genre to see its most-played stations.`,
+      title: "Live Radio by Genre — Pop, Rock, News, Jazz & More | World Radio",
+      description: clamp(
+        `Browse live radio by genre: ${genres
+          .slice(0, 7)
+          .map((g) => g.name)
+          .join(", ")} and more across ${genres.length} genres. Pick one to see its most-played stations and listen free, no account needed.`
+      ),
       heading: "Radio stations by genre",
       lede: `${genres.length} genres, from pop and rock to news, jazz and classical. Pick one to see the stations people play most.`,
       canonical: `${SITE}/genres/`,
@@ -697,19 +759,23 @@ const main = async () => {
     write(
       `country/${c.slug}/index.html`,
       directoryPage({
-        title: `${c.name} radio stations — ${c.count} live, free on World Radio`,
-        description: `${c.name}: ${c.count} live radio stations${
-          c.stations.length
-            ? ` including ${c.stations
-                .slice(0, 3)
-                .map((s) => s.name)
-                .join(", ")}`
-            : ""
-        }. Listen free — no account, works on your phone, desktop and car.`,
+        title: `${c.name} Radio Stations — Listen Live Free | World Radio`,
+        description: clamp(
+          `${c.count} live radio stations in ${c.name}${
+            c.stations.length
+              ? `, including ${c.stations
+                  .slice(0, 3)
+                  .map((s) => s.name)
+                  .join(", ")}`
+              : ""
+          }. Listen free in your browser — no app, no account, on phone, desktop and in the car.`
+        ),
         heading: `${c.name} radio stations`,
         lede: `${c.count} live stations, most played first — tap any of them to listen instantly.`,
         canonical: `${SITE}/country/${c.slug}/`,
-        ogImage: card("country", c.slug, c.name, `${c.count} live radio stations`),
+        ogImage: hasCard("country", c.slug)
+          ? card("country", c.slug, c.name, `${c.count} live radio stations`)
+          : homeCard,
         crumbs: [
           { name: "World Radio", href: "/" },
           { name: "Countries", href: "/countries/" },
@@ -731,14 +797,23 @@ const main = async () => {
     write(
       `genre/${g.slug}/index.html`,
       directoryPage({
-        title: `${g.name} radio stations — listen live free on World Radio`,
-        description: `Listen live to ${g.name} radio: ${g.count} ${g.name} stations from around the world${
-          g.stations.length ? `, including ${g.stations.slice(0, 3).map((s) => s.name).join(", ")}` : ""
-        }. Free, no account, and your lock-screen controls keep working.`,
-        heading: `${g.name} radio stations`,
+        title: `Live ${titleCase(g.name)} Radio Stations — Listen Free | World Radio`,
+        description: clamp(
+          `Listen live to ${g.name} radio: ${g.count} ${g.name} stations from around the world${
+            g.stations.length
+              ? `, including ${g.stations
+                  .slice(0, 3)
+                  .map((s) => s.name)
+                  .join(", ")}`
+              : ""
+          }. Free, no account, and it keeps playing on your lock screen and in the car.`
+        ),
+        heading: `${titleCase(g.name)} radio stations`,
         lede: `${g.count} ${g.name} stations, worldwide. Tap one to listen instantly.`,
         canonical: `${SITE}/genre/${g.slug}/`,
-        ogImage: card("genre", g.slug, `${g.name} radio`, `${g.count} live stations`),
+        ogImage: hasCard("genre", g.slug)
+          ? card("genre", g.slug, `${g.name} radio`, `${g.count} live stations`)
+          : homeCard,
         crumbs: [
           { name: "World Radio", href: "/" },
           { name: "Genres", href: "/genres/" },
@@ -775,23 +850,28 @@ const main = async () => {
         .filter(Boolean)
         .slice(0, 3),
     };
-    const ogImage = withOwnCard.has(s.stationuuid)
-      ? card(
-          "station",
-          s.slug,
-          s.name,
-          [s.state, country ? country.name : s.country].filter(Boolean).join(", "),
-          /^https?:\/\//i.test(s.favicon || "") ? s.favicon : undefined
-        )
-      : country
-      ? `${SITE}/og/country/${country.slug}.jpg`
-      : homeCard;
+    const ogImage =
+      withOwnCard.has(s.stationuuid) && hasCard("station", s.slug)
+        ? card(
+            "station",
+            s.slug,
+            s.name,
+            [titleCase(s.state), country ? country.name : s.country].filter(Boolean).join(", "),
+            /^https?:\/\//i.test(s.favicon || "") ? s.favicon : undefined
+          )
+        : country && hasCard("country", country.slug)
+        ? `${SITE}/og/country/${country.slug}.jpg`
+        : homeCard;
 
     const html = stationPage({ shell, station: s, canonical, ogImage, related });
     write(`station/${s.slug}/index.html`, html);
     // The old address stays alive (it is inside messages people already sent) and
-    // declares the short one canonical, so any signal consolidates there.
-    write(`station/${s.slug}/${s.stationuuid}/index.html`, html);
+    // declares the short one canonical, so any signal consolidates there. Only the
+    // top of the catalogue gets a physical copy: the app resolves both shapes for a
+    // visitor, and a crawler needs the file only where a link is likely to exist.
+    if (urls.length < LEGACY_ADDRESS_LIMIT) {
+      write(`station/${s.slug}/${s.stationuuid}/index.html`, html);
+    }
     urls.push(canonical);
     written += 1;
   }
@@ -894,7 +974,7 @@ const main = async () => {
         `
     <title>World Radio — live radio from around the world</title>
     <meta name="robots" content="noindex, follow" />
-    <meta name="description" content="Live radio from around the world on a 3D globe. Spin it, tap a glowing dot, and listen — free, no account, no tracking." />
+    <meta name="description" content="This station page isn't available. Open World Radio to listen live to 50,000+ stations from every country — free, no account." />
     <meta property="og:title" content="World Radio — live radio from around the world" />
     <meta property="og:description" content="Spin the globe, tap a station, and listen. Free, no account, no tracking." />
     <meta property="og:image" content="${homeCard}" />

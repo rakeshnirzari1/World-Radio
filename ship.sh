@@ -5,9 +5,9 @@
 # splits timed out mid-flight. It also gates: a generator pass that silently did not run
 # once shipped a build 1566 files short, so this refuses to deploy a build that is.
 set -euo pipefail
-R="C:/Users/Rakesh Patel/AppData/Local/Temp/Radio-Melody"
+R="C:/Users/Rakesh Patel/AppData/Local/Temp/worldradio"
 S="C:/Users/Rakesh Patel/AppData/Local/hermes/cache/scratch"
-MIN_FILES=${MIN_FILES:-12500}
+MIN_FILES=${MIN_FILES:-15000}
 cd "$R"
 export REACT_APP_PROXY_URL="https://radio-melody-relay.rvpnrp.workers.dev"
 export CI=false
@@ -29,7 +29,7 @@ BUNDLE=$(grep -o "main\.[a-f0-9]*\.js" frontend/build/index.html | head -1)
 echo "== gate: files=$N index=$IDX og=$OG bundle=$BUNDLE"
 [ "$N" -ge "$MIN_FILES" ] || { echo "REFUSING TO DEPLOY: only $N files"; exit 1; }
 [ "$IDX" -ge 500 ] || { echo "REFUSING TO DEPLOY: station index missing"; exit 1; }
-[ "$OG" -ge 3000 ] || { echo "REFUSING TO DEPLOY: share cards missing"; exit 1; }
+[ "$OG" -ge 1500 ] || { echo "REFUSING TO DEPLOY: share cards missing"; exit 1; }
 [ -n "$BUNDLE" ] || { echo "REFUSING TO DEPLOY: no bundle in index.html"; exit 1; }
 grep -q "$BUNDLE" "$(find frontend/build/station -name index.html | head -1)" || { echo "REFUSING TO DEPLOY: pages carry a stale bundle"; exit 1; }
 echo "== deploy"

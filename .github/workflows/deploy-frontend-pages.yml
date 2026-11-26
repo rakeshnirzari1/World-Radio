@@ -79,8 +79,9 @@ jobs:
         env:
           BUILD_DIR: frontend/build
           SITE_URL: https://worldradio.io
-          PRERENDER_LIMIT: "4000"
-          OG_STATION_CARDS: "4000"
+          PRERENDER_LIMIT: "10000"
+          OG_STATION_CARDS: "2200"
+          LEGACY_ADDRESS_LIMIT: "600"
         run: node tools/prerender.mjs
 
       - name: Set up Python

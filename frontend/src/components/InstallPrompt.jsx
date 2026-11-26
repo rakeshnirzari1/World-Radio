@@ -9,7 +9,7 @@ const SNOOZE_DAYS = 14;
 // of this app on a locked phone. Android/desktop Chromium fires
 // beforeinstallprompt; iOS Safari has no such event, so it gets instructions
 // instead.
-const InstallPrompt = () => {
+const InstallPrompt = ({ raised }) => {
   const [deferred, setDeferred] = useState(null);
   const [visible, setVisible] = useState(false);
   const [ios, setIos] = useState(false);
@@ -76,7 +76,13 @@ const InstallPrompt = () => {
   if (!visible) return null;
 
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-24 z-40 flex justify-center px-4 sm:bottom-28">
+    // `raised` is the phone/car shell, which has its own mini player and tab bar
+    // across the bottom. At bottom-24 the banner sat on top of both.
+    <div
+      className={`pointer-events-none absolute inset-x-0 z-40 flex justify-center px-4 ${
+        raised ? "bottom-[9.5rem]" : "bottom-24 sm:bottom-28"
+      }`}
+    >
       <div className="rm-glass pointer-events-auto flex w-full max-w-md items-center gap-3 rounded-2xl px-4 py-3 shadow-[0_16px_50px_rgba(0,0,0,0.5)]">
         <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-[#2fe08a] text-[#05070a]">
           <Download size={19} />

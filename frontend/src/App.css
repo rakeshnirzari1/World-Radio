@@ -7,6 +7,24 @@
   overflow: hidden;
 }
 
+/* Horizontal chip rows: scroll with a finger, no visible scrollbar. */
+.rm-no-bar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.rm-no-bar::-webkit-scrollbar {
+  display: none;
+}
+
+/* The phone/car shell is an app, not a document: no blue tap flashes, no
+   rubber-band on the page itself, and text is not selectable by accident. */
+.rm-app-shell {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  overscroll-behavior: none;
+}
+
 /* Respect iOS notch / home-indicator safe areas */
 .rm-safe-bottom {
   padding-bottom: env(safe-area-inset-bottom, 0px);

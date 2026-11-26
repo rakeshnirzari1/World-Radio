@@ -49,6 +49,10 @@ import DrivingMode from "./components/DrivingMode";
 import ReactiveBackground from "./components/ReactiveBackground";
 import InstallPrompt from "./components/InstallPrompt";
 import AlarmWatcher from "./components/AlarmWatcher";
+// The phone and car interface. Rendered instead of the globe, not on top of it —
+// see hooks/useViewMode.js for why the decision cannot be a CSS breakpoint.
+import MobileRadio from "./components/MobileRadio";
+import useViewMode from "./hooks/useViewMode";
 import EmbedPlayer from "./components/EmbedPlayer";
 import PrivacyContent from "./components/PrivacyContent";
 import { orderByHealth } from "./lib/health";
@@ -150,6 +154,10 @@ const RadioApp = () => {
   const params = useParams();
   const navigate = useNavigate();
   const location = useLocation();
+  // "desktop" | "phone" | "car". Read before anything renders, because it decides
+  // whether the WebGL globe is mounted at all.
+  const viewMode = useViewMode();
+  const compact = viewMode !== "desktop";
   const [stations, setStations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [panel, setPanel] = useState(null);
@@ -497,7 +505,9 @@ const RadioApp = () => {
   useEffect(() => {
     if (current) {
       const place = [current.state, current.country].filter(Boolean).join(", ");
-      document.title = `${current.name}${place ? " — " + place : ""} | World Radio`;
+      document.title = `${current.name}${
+        place ? ` — Live Radio from ${place}` : " — Live Radio"
+      } | World Radio`;
       const atHome = homeStationRef.current === current.id;
       if (!atHome) {
         // The address bar carries the readable address, never the UUID. The exact
@@ -518,7 +528,7 @@ const RadioApp = () => {
         };
       }
     } else {
-      document.title = "World Radio — Live radio from around the world";
+      document.title = "World Radio — Listen to 50,000+ Live Radio Stations Free";
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id, location.pathname]);
@@ -1160,6 +1170,28 @@ const RadioApp = () => {
     <div className="App rm-star-field">
       <ReactiveBackground />
       <IntroLoader show={loading} />
+      {compact ? (
+        <MobileRadio
+          stations={stations}
+          countryStations={countryStations}
+          countryMode={countryMode}
+          countries={countryList}
+          genre={genre}
+          setGenre={setGenre}
+          onEnterCountry={enterCountry}
+          onLeaveCountry={leaveCountry}
+          onOpen={handleOpen}
+          onHome={goHome}
+          onLocate={locateMe}
+          onSurprise={spinTheGlobe}
+          onRoadTrip={roadTrip}
+          onPlayStation={handleStationClick}
+          roadTripOn={roadTripOn}
+          onDriving={() => setDriving(true)}
+          car={viewMode === "car"}
+        />
+      ) : (
+        <>
       <React.Suspense fallback={<GlobeSketch />}>
       <GlobeView
         stations={countryStations || filtered}
@@ -1379,7 +1411,9 @@ const RadioApp = () => {
       </div>
 
       <PlayerBar />
-      <InstallPrompt />
+        </>
+      )}
+      {viewMode !== "car" && <InstallPrompt raised={viewMode === "phone"} />}
       {driving && <DrivingMode onExit={() => setDriving(false)} />}
       <SidePanel
         panel={panel}
