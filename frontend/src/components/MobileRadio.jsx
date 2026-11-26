@@ -39,9 +39,18 @@ import { prettyCountry } from "../lib/countryNames";
  * source of truth to drift from the desktop one.
  */
 
+const capitalise = (s) => {
+  const t = String(s || "").trim();
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : "";
+};
+
+// Where a station is, in words a person reads: the catalogue stores the state in
+// whatever case it was typed ("tokyo") and the country in its formal name ("The
+// United States Of America"), both of which look wrong on a 15px row.
 const place = (station) =>
-  [station && station.state, station && station.country].filter(Boolean).join(", ") ||
-  "Worldwide";
+  [capitalise(station && station.state), prettyCountry(station && station.country)]
+    .filter(Boolean)
+    .join(", ") || "Worldwide";
 
 const Art = ({ station, size = 48 }) => {
   const [err, setErr] = useState(false);
